@@ -1,0 +1,1737 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 8e4037922..4d90466c7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -139,6 +139,8 @@ once_cell = "1.7.2"
+ rand = "0.8.5"
+ serde = "1.0.152"
+ serde_json = "1.0.91"
++sphinx-packet = { git = "https://github.com/lambdapioneer/forked-nym-sphinx", branch = "pudding" }
++#uncomment for local dev: sphinx-packet = { path ="../forked-nym-sphinx" }
+ tap = "1.0.1"
+ thiserror = "1.0.38"
+ tokio = "1.24.1"
+diff --git a/common/client-core/src/client/base_client/mod.rs b/common/client-core/src/client/base_client/mod.rs
+index aecb7eb5c..d479950a0 100644
+--- a/common/client-core/src/client/base_client/mod.rs
++++ b/common/client-core/src/client/base_client/mod.rs
+@@ -1,7 +1,34 @@
+ // Copyright 2022-2023 - Nym Technologies SA <contact@nymtech.net>
+ // SPDX-License-Identifier: Apache-2.0
+ 
+-use super::received_buffer::ReceivedBufferMessage;
++use std::sync::Arc;
++
++use futures::channel::mpsc;
++use log::{debug, info};
++use tap::TapFallible;
++use url::Url;
++
++#[cfg(target_arch = "wasm32")]
++use nym_bandwidth_controller::wasm_mockups::DkgQueryClient;
++use nym_bandwidth_controller::BandwidthController;
++use nym_credential_storage::storage::Storage as CredentialStorage;
++use nym_crypto::asymmetric::{encryption, identity};
++use nym_gateway_client::{
++    AcknowledgementReceiver, AcknowledgementSender, GatewayClient, MixnetMessageReceiver,
++    MixnetMessageSender,
++};
++use nym_sphinx::acknowledgements::AckKey;
++use nym_sphinx::addressing::clients::Recipient;
++use nym_sphinx::addressing::nodes::NodeIdentity;
++use nym_sphinx::params::PacketType;
++use nym_sphinx::receiver::{ReconstructedMessage, SphinxMessageReceiver};
++use nym_task::connections::{ConnectionCommandReceiver, ConnectionCommandSender, LaneQueueLengths};
++use nym_task::{TaskClient, TaskManager};
++use nym_topology::provider_trait::TopologyProvider;
++#[cfg(not(target_arch = "wasm32"))]
++use nym_validator_client::nyxd::traits::DkgQueryClient;
++
++use crate::client::base_client::storage::gateway_details::GatewayDetailsStore;
+ use crate::client::base_client::storage::MixnetClientStorage;
+ use crate::client::cover_traffic_stream::LoopCoverTrafficStream;
+ use crate::client::inbound_messages::{InputMessage, InputMessageReceiver, InputMessageSender};
+@@ -24,35 +51,10 @@ use crate::client::topology_control::{
+ };
+ use crate::config::{Config, DebugConfig, GatewayEndpointConfig};
+ use crate::error::ClientCoreError;
++use crate::init::{setup_gateway, GatewaySetup, InitialisationDetails};
+ use crate::{config, spawn_future};
+-use futures::channel::mpsc;
+-use log::{debug, info};
+-use nym_bandwidth_controller::BandwidthController;
+-use nym_credential_storage::storage::Storage as CredentialStorage;
+-use nym_crypto::asymmetric::{encryption, identity};
+-use nym_gateway_client::{
+-    AcknowledgementReceiver, AcknowledgementSender, GatewayClient, MixnetMessageReceiver,
+-    MixnetMessageSender,
+-};
+-use nym_sphinx::acknowledgements::AckKey;
+-use nym_sphinx::addressing::clients::Recipient;
+-use nym_sphinx::addressing::nodes::NodeIdentity;
+-use nym_sphinx::params::PacketType;
+-use nym_sphinx::receiver::{ReconstructedMessage, SphinxMessageReceiver};
+-use nym_task::connections::{ConnectionCommandReceiver, ConnectionCommandSender, LaneQueueLengths};
+-use nym_task::{TaskClient, TaskManager};
+-use nym_topology::provider_trait::TopologyProvider;
+-use std::sync::Arc;
+-use tap::TapFallible;
+-use url::Url;
+-
+-#[cfg(target_arch = "wasm32")]
+-use nym_bandwidth_controller::wasm_mockups::DkgQueryClient;
+ 
+-use crate::client::base_client::storage::gateway_details::GatewayDetailsStore;
+-use crate::init::{setup_gateway, GatewaySetup, InitialisationDetails};
+-#[cfg(not(target_arch = "wasm32"))]
+-use nym_validator_client::nyxd::traits::DkgQueryClient;
++use super::received_buffer::ReceivedBufferMessage;
+ 
+ #[cfg(all(not(target_arch = "wasm32"), feature = "fs-surb-storage"))]
+ pub mod non_wasm_helpers;
+@@ -595,6 +597,11 @@ where
+         debug!("Core client startup finished!");
+         debug!("The address of this client is: {self_address}");
+ 
++        let client_secrets = ClientSecrets {
++            identity_keypair: managed_keys.identity_keypair(),
++            encryption_keypair: managed_keys.encryption_keypair(),
++        };
++
+         Ok(BaseClient {
+             address: self_address,
+             client_input: ClientInputStatus::AwaitingProducer {
+@@ -614,10 +621,18 @@ where
+                 topology_accessor: shared_topology_accessor,
+             },
+             task_manager,
++            client_secrets,
+         })
+     }
+ }
+ 
++/// Exposing the client secrets for custom protocols that re-use them
++#[derive(Clone)]
++pub struct ClientSecrets {
++    pub identity_keypair: Arc<identity::KeyPair>,
++    pub encryption_keypair: Arc<encryption::KeyPair>,
++}
++
+ pub struct BaseClient {
+     pub address: Recipient,
+     pub client_input: ClientInputStatus,
+@@ -625,4 +640,5 @@ pub struct BaseClient {
+     pub client_state: ClientState,
+ 
+     pub task_manager: TaskManager,
++    pub client_secrets: ClientSecrets,
+ }
+diff --git a/common/client-core/src/client/inbound_messages.rs b/common/client-core/src/client/inbound_messages.rs
+index 1530073d3..53bde2604 100644
+--- a/common/client-core/src/client/inbound_messages.rs
++++ b/common/client-core/src/client/inbound_messages.rs
+@@ -3,6 +3,7 @@
+ 
+ use nym_sphinx::addressing::clients::Recipient;
+ use nym_sphinx::anonymous_replies::requests::AnonymousSenderTag;
++use nym_sphinx::anonymous_replies::ReplySurb;
+ use nym_sphinx::forwarding::packet::MixPacket;
+ use nym_sphinx::params::PacketType;
+ use nym_task::connections::TransmissionLane;
+@@ -12,6 +13,13 @@ pub type InputMessageReceiver = tokio::sync::mpsc::Receiver<InputMessage>;
+ 
+ #[derive(Debug)]
+ pub enum InputMessage {
++    /// Sends a message using the supplied Surbs
++    WithSuppliedSurbs {
++        surbs: Vec<ReplySurb>,
++        data: Vec<u8>,
++        lane: TransmissionLane,
++    },
++
+     /// Fire an already prepared mix packets into the network.
+     /// No guarantees are made about it. For example no retransmssion
+     /// will be attempted if it gets dropped.
+@@ -144,6 +152,7 @@ impl InputMessage {
+             | InputMessage::Anonymous { lane, .. }
+             | InputMessage::Reply { lane, .. }
+             | InputMessage::Premade { lane, .. } => lane,
++            InputMessage::WithSuppliedSurbs { lane, .. } => lane,
+             InputMessage::MessageWrapper { message, .. } => message.lane(),
+         }
+     }
+diff --git a/common/client-core/src/client/real_messages_control/acknowledgement_control/input_message_listener.rs b/common/client-core/src/client/real_messages_control/acknowledgement_control/input_message_listener.rs
+index 19ba2d1ca..e412579b7 100644
+--- a/common/client-core/src/client/real_messages_control/acknowledgement_control/input_message_listener.rs
++++ b/common/client-core/src/client/real_messages_control/acknowledgement_control/input_message_listener.rs
+@@ -8,6 +8,7 @@ use crate::client::replies::reply_controller::ReplyControllerSender;
+ use log::*;
+ use nym_sphinx::addressing::clients::Recipient;
+ use nym_sphinx::anonymous_replies::requests::AnonymousSenderTag;
++use nym_sphinx::anonymous_replies::ReplySurb;
+ use nym_sphinx::forwarding::packet::MixPacket;
+ use nym_sphinx::params::PacketType;
+ use nym_task::connections::TransmissionLane;
+@@ -67,6 +68,18 @@ where
+             .send_reply(recipient_tag, data, lane)
+     }
+ 
++    async fn handle_message_with_supplied_surbs(
++        &mut self,
++        surbs: Vec<ReplySurb>,
++        data: Vec<u8>,
++        lane: TransmissionLane,
++        packet_type: PacketType,
++    ) {
++        self.message_handler
++            .try_send_message_with_supplied_surbs(surbs, data, lane, packet_type)
++            .await
++    }
++
+     async fn handle_plain_message(
+         &mut self,
+         recipient: Recipient,
+@@ -102,6 +115,10 @@ where
+ 
+     async fn on_input_message(&mut self, msg: InputMessage) {
+         match msg {
++            InputMessage::WithSuppliedSurbs { surbs, data, lane } => {
++                self.handle_message_with_supplied_surbs(surbs, data, lane, PacketType::Mix)
++                    .await;
++            }
+             InputMessage::Regular {
+                 recipient,
+                 data,
+@@ -131,6 +148,10 @@ where
+                 message,
+                 packet_type,
+             } => match *message {
++                InputMessage::WithSuppliedSurbs { surbs, data, lane } => {
++                    self.handle_message_with_supplied_surbs(surbs, data, lane, packet_type)
++                        .await;
++                }
+                 InputMessage::Regular {
+                     recipient,
+                     data,
+diff --git a/common/client-core/src/client/real_messages_control/message_handler.rs b/common/client-core/src/client/real_messages_control/message_handler.rs
+index 07482aa77..566a5a6cb 100644
+--- a/common/client-core/src/client/real_messages_control/message_handler.rs
++++ b/common/client-core/src/client/real_messages_control/message_handler.rs
+@@ -1,14 +1,16 @@
+ // Copyright 2022 - Nym Technologies SA <contact@nymtech.net>
+ // SPDX-License-Identifier: Apache-2.0
+ 
+-use crate::client::real_messages_control::acknowledgement_control::PendingAcknowledgement;
+-use crate::client::real_messages_control::real_traffic_stream::{
+-    BatchRealMessageSender, RealMessage,
+-};
+-use crate::client::real_messages_control::{AckActionSender, Action};
+-use crate::client::replies::reply_storage::{ReceivedReplySurbsMap, SentReplyKeys, UsedSenderTags};
+-use crate::client::topology_control::{TopologyAccessor, TopologyReadPermit};
++use std::collections::HashMap;
++use std::iter::zip;
++use std::sync::Arc;
++use std::time::Duration;
++
+ use log::{debug, error, info, trace, warn};
++use rand::rngs::OsRng;
++use rand::{CryptoRng, Rng};
++use thiserror::Error;
++
+ use nym_sphinx::acknowledgements::AckKey;
+ use nym_sphinx::addressing::clients::Recipient;
+ use nym_sphinx::anonymous_replies::requests::{AnonymousSenderTag, RepliableMessage, ReplyMessage};
+@@ -16,15 +18,18 @@ use nym_sphinx::anonymous_replies::{ReplySurb, SurbEncryptionKey};
+ use nym_sphinx::chunking::fragment::{Fragment, FragmentIdentifier};
+ use nym_sphinx::message::NymMessage;
+ use nym_sphinx::params::{PacketSize, PacketType, DEFAULT_NUM_MIX_HOPS};
+-use nym_sphinx::preparer::{MessagePreparer, PreparedFragment};
++use nym_sphinx::preparer::{MessagePreparer, PreparedFragment, SurbOrigin};
+ use nym_sphinx::Delay;
+ use nym_task::connections::TransmissionLane;
+ use nym_topology::{NymTopology, NymTopologyError};
+-use rand::{CryptoRng, Rng};
+-use std::collections::HashMap;
+-use std::sync::Arc;
+-use std::time::Duration;
+-use thiserror::Error;
++
++use crate::client::real_messages_control::acknowledgement_control::PendingAcknowledgement;
++use crate::client::real_messages_control::real_traffic_stream::{
++    BatchRealMessageSender, RealMessage,
++};
++use crate::client::real_messages_control::{AckActionSender, Action};
++use crate::client::replies::reply_storage::{ReceivedReplySurbsMap, SentReplyKeys, UsedSenderTags};
++use crate::client::topology_control::{TopologyAccessor, TopologyReadPermit};
+ 
+ // TODO: move that error elsewhere since it seems to be contaminating different files
+ #[derive(Debug, Error)]
+@@ -49,7 +54,7 @@ impl PreparationError {
+ }
+ 
+ #[derive(Debug, Error)]
+-#[error("Failed to prepare packets - {source}. {} reply surbs will be returned", .returned_surbs.as_ref().map(|s| s.len()).unwrap_or_default())]
++#[error("Failed to prepare packets - {source}. {} reply surbs will be returned", .returned_surbs.as_ref().map(| s | s.len()).unwrap_or_default())]
+ pub struct SurbWrappedPreparationError {
+     #[source]
+     source: PreparationError,
+@@ -267,6 +272,7 @@ where
+         message: ReplyMessage,
+         reply_surb: ReplySurb,
+         is_extra_surb_request: bool,
++        surb_origin: SurbOrigin,
+     ) -> Result<(), SurbWrappedPreparationError> {
+         let msg = NymMessage::new_reply(message);
+         let packet_size = self.optimal_packet_size(&msg);
+@@ -288,7 +294,7 @@ where
+         let chunk = fragment.pop().unwrap();
+         let chunk_clone = chunk.clone();
+         let prepared_fragment = self
+-            .try_prepare_single_reply_chunk_for_sending(reply_surb, chunk_clone)
++            .try_prepare_single_reply_chunk_for_sending(reply_surb, chunk_clone, surb_origin)
+             .await?;
+ 
+         let real_messages = RealMessage::new(
+@@ -310,6 +316,62 @@ where
+         Ok(())
+     }
+ 
++    pub(crate) async fn try_send_multisurb_message(
++        &mut self,
++        target: AnonymousSenderTag,
++        message: ReplyMessage,
++        reply_surbs: Vec<ReplySurb>,
++        is_extra_surb_request: bool,
++        surb_origin: SurbOrigin,
++    ) -> Result<(), SurbWrappedPreparationError> {
++        let msg = NymMessage::new_reply(message);
++        let packet_size = self.optimal_packet_size(&msg);
++        debug!("Using {packet_size} packets for {msg}");
++
++        let fragments = self
++            .message_preparer
++            .pad_and_split_message(msg, packet_size);
++
++        if fragments.len() > reply_surbs.len() {
++            panic! {"message ({} fragments) too long for reply surbs (amount {})!", fragments.len(), reply_surbs.len()}
++        }
++
++        let mut real_messages = vec![];
++        let mut pending_acks = vec![];
++
++        for (reply_surb, fragment) in zip(reply_surbs.into_iter(), fragments.into_iter()) {
++            let chunk_clone = fragment.clone();
++            let prepared_fragment = self
++                .try_prepare_single_reply_chunk_for_sending(reply_surb, chunk_clone, surb_origin)
++                .await?;
++
++            let real_message = RealMessage::new(
++                prepared_fragment.mix_packet,
++                Some(fragment.fragment_identifier()),
++            );
++            real_messages.push(real_message);
++
++            let delay = prepared_fragment.total_delay;
++            let pending_ack = PendingAcknowledgement::new_anonymous(
++                fragment,
++                delay,
++                target,
++                is_extra_surb_request,
++            );
++            pending_acks.push(pending_ack);
++        }
++
++        let lane = if is_extra_surb_request {
++            TransmissionLane::ReplySurbRequest
++        } else {
++            TransmissionLane::General
++        };
++
++        self.forward_messages(real_messages, lane).await;
++        self.insert_pending_acks(pending_acks);
++        Ok(())
++    }
++
+     pub(crate) async fn try_request_additional_reply_surbs(
+         &mut self,
+         from: AnonymousSenderTag,
+@@ -320,8 +382,14 @@ where
+ 
+         let surbs_request =
+             ReplyMessage::new_surb_request_message(self.config.sender_address, amount);
+-        self.try_send_single_surb_message(from, surbs_request, reply_surb, true)
+-            .await
++        self.try_send_single_surb_message(
++            from,
++            surbs_request,
++            reply_surb,
++            true,
++            SurbOrigin::SourceCreated,
++        )
++        .await
+     }
+ 
+     // // TODO: this will require additional argument to make it use different variant of `ReplyMessage`
+@@ -480,6 +548,26 @@ where
+         Ok(())
+     }
+ 
++    pub(crate) async fn try_send_message_with_supplied_surbs(
++        &mut self,
++        surbs: Vec<ReplySurb>,
++        message: Vec<u8>,
++        _lane: TransmissionLane,
++        _packet_type: PacketType,
++    ) {
++        let reply_message = ReplyMessage::new_data_message(message);
++        let target_tag = AnonymousSenderTag::new_random(&mut OsRng);
++        self.try_send_multisurb_message(
++            target_tag,
++            reply_message,
++            surbs,
++            false,
++            SurbOrigin::External,
++        )
++        .await
++        .unwrap()
++    }
++
+     pub(crate) async fn try_send_additional_reply_surbs(
+         &mut self,
+         recipient: Recipient,
+@@ -591,6 +679,7 @@ where
+                         &self.config.ack_key,
+                         reply_surb,
+                         PacketType::Mix,
++                        SurbOrigin::SourceCreated,
+                     )
+                     .unwrap()
+             })
+@@ -601,6 +690,7 @@ where
+         &mut self,
+         reply_surb: ReplySurb,
+         chunk: Fragment,
++        surb_origin: SurbOrigin,
+     ) -> Result<PreparedFragment, SurbWrappedPreparationError> {
+         let topology_permit = self.topology_access.get_read_permit().await;
+         let topology = match self.get_topology(&topology_permit) {
+@@ -616,6 +706,7 @@ where
+                 &self.config.ack_key,
+                 reply_surb,
+                 PacketType::Mix,
++                surb_origin,
+             )
+             .unwrap();
+ 
+diff --git a/common/client-core/src/client/received_buffer.rs b/common/client-core/src/client/received_buffer.rs
+index b9c93d892..7b9b8b49b 100644
+--- a/common/client-core/src/client/received_buffer.rs
++++ b/common/client-core/src/client/received_buffer.rs
+@@ -9,18 +9,24 @@ use futures::lock::Mutex;
+ use futures::StreamExt;
+ use log::*;
+ use nym_crypto::asymmetric::encryption;
+-use nym_crypto::Digest;
++use nym_crypto::asymmetric::encryption::PublicKey;
++use nym_crypto::symmetric::stream_cipher;
++use nym_crypto::symmetric::stream_cipher::CipherKey;
+ use nym_gateway_client::MixnetMessageReceiver;
+ use nym_sphinx::anonymous_replies::requests::{
+     RepliableMessage, RepliableMessageContent, ReplyMessage, ReplyMessageContent,
+ };
+ use nym_sphinx::anonymous_replies::{encryption_key::EncryptionKeyDigest, SurbEncryptionKey};
+ use nym_sphinx::message::{NymMessage, PlainMessage};
+-use nym_sphinx::params::ReplySurbKeyDigestAlgorithm;
++use nym_sphinx::params::{SURB_MAX_VARIANT_OVERHEAD, SURB_NORMAL_VARIANT_OVERHEAD};
+ use nym_sphinx::receiver::{MessageReceiver, MessageRecoveryError, ReconstructedMessage};
+ use std::collections::HashSet;
+ use std::sync::Arc;
+ 
++use nym_crypto::aes;
++use nym_crypto::ctr;
++type Aes128Ctr = ctr::Ctr64LE<aes::Aes128>;
++
+ // Buffer Requests to say "hey, send any reconstructed messages to this channel"
+ // or to say "hey, I'm going offline, don't send anything more to me. Just buffer them instead"
+ pub type ReceivedBufferRequestSender = mpsc::UnboundedSender<ReceivedBufferMessage>;
+@@ -310,20 +316,64 @@ impl<R: MessageReceiver> ReceivedMessagesBuffer<R> {
+     fn get_reply_key<'a>(
+         &self,
+         raw_message: &'a mut [u8],
++        local_encryption_key_pair: &Arc<encryption::KeyPair>,
+     ) -> Option<(SurbEncryptionKey, &'a mut [u8])> {
+-        let reply_surb_digest_size = ReplySurbKeyDigestAlgorithm::output_size();
+-        if raw_message.len() < reply_surb_digest_size {
++        if raw_message.len() < SURB_MAX_VARIANT_OVERHEAD {
+             return None;
+         }
+ 
++        //
++        // VARIANT: EXTERNAL
++        //
++        // first try to decrypt as an external pudding SURB;
++        // if that fails, we try below to decrypt as a reply
++        //
++        // See: `ReplySurb::build_external_variant_data` for more discussion
++
++        // re-derive the shared secret
++        let possible_ephemeral_public_key = PublicKey::from_bytes(&raw_message[0..32]).unwrap();
++        let local_private_key = local_encryption_key_pair.private_key();
++        let ephemeral_secret = local_private_key.diffie_hellman(&possible_ephemeral_public_key);
++
++        // recover encryption key from the shared secret
++        let key = CipherKey::<Aes128Ctr>::from_slice(&ephemeral_secret[16..32]);
++
++        // perform the decryption check
++        let possible_decrypted_zeros = stream_cipher::decrypt::<Aes128Ctr>(
++            &key,
++            &stream_cipher::zero_iv::<Aes128Ctr>(), // all zero IV is fine here
++            &raw_message[32..40],
++        );
++        if possible_decrypted_zeros == [0u8; 8] {
++            // if it succeeds we can decrypt the surb encryption key and return it with the rest
++            // of the message
++            let iv = stream_cipher::iv_from_slice::<Aes128Ctr>(&ephemeral_secret[..16]);
++            let surb_encryption_key =
++                SurbEncryptionKey::try_from_bytes(&stream_cipher::decrypt::<Aes128Ctr>(
++                    &key,
++                    &iv,
++                    &raw_message[40..56],
++                ))
++                .unwrap();
++            return Some((
++                surb_encryption_key,
++                &mut raw_message[SURB_MAX_VARIANT_OVERHEAD..],
++            ));
++        }
++
++        //
++        // VARIANT: REGULAR
++        //
++
+         let possible_key_digest =
+-            EncryptionKeyDigest::clone_from_slice(&raw_message[..reply_surb_digest_size]);
++            EncryptionKeyDigest::clone_from_slice(&raw_message[..SURB_NORMAL_VARIANT_OVERHEAD]);
++
+         self.reply_key_storage
+             .try_pop(possible_key_digest)
+             .map(|reply_encryption_key| {
+                 (
+                     *reply_encryption_key,
+-                    &mut raw_message[reply_surb_digest_size..],
++                    &mut raw_message[SURB_MAX_VARIANT_OVERHEAD..],
+                 )
+             })
+     }
+@@ -345,12 +395,13 @@ impl<R: MessageReceiver> ReceivedMessagesBuffer<R> {
+         for mut msg in msgs {
+             // check first `HasherOutputSize` bytes if they correspond to known encryption key
+             // if yes - this is a reply message
+-            let completed_message =
+-                if let Some((reply_key, reply_message)) = self.get_reply_key(&mut msg) {
+-                    inner_guard.process_received_reply(reply_message, reply_key)?
+-                } else {
+-                    inner_guard.process_received_regular_packet(msg)
+-                };
++            let completed_message = if let Some((reply_key, reply_message)) =
++                self.get_reply_key(&mut msg, &inner_guard.local_encryption_keypair)
++            {
++                inner_guard.process_received_reply(reply_message, reply_key)?
++            } else {
++                inner_guard.process_received_regular_packet(msg)
++            };
+ 
+             if let Some(completed) = completed_message {
+                 info!("received {completed}");
+diff --git a/common/client-core/src/client/replies/reply_controller/mod.rs b/common/client-core/src/client/replies/reply_controller/mod.rs
+index 4ba9ce3ac..3ac113dd8 100644
+--- a/common/client-core/src/client/replies/reply_controller/mod.rs
++++ b/common/client-core/src/client/replies/reply_controller/mod.rs
+@@ -11,6 +11,7 @@ use nym_sphinx::addressing::clients::Recipient;
+ use nym_sphinx::anonymous_replies::requests::AnonymousSenderTag;
+ use nym_sphinx::anonymous_replies::ReplySurb;
+ use nym_sphinx::chunking::fragment::{Fragment, FragmentIdentifier};
++use nym_sphinx::preparer::SurbOrigin;
+ use nym_task::connections::{ConnectionId, TransmissionLane};
+ use rand::{CryptoRng, Rng};
+ use std::cmp::{max, min};
+@@ -565,7 +566,7 @@ where
+ 
+         // if this is retransmission for obtaining additional reply surbs,
+         // we can dip below the storage threshold
+-        let (maybe_reply_surb, _) = if extra_surbs_request {
++        let x = if extra_surbs_request {
+             self.full_reply_storage
+                 .surbs_storage_ref()
+                 .get_reply_surb_ignoring_threshold(&recipient_tag)
+@@ -573,13 +574,22 @@ where
+             self.full_reply_storage
+                 .surbs_storage_ref()
+                 .get_reply_surb(&recipient_tag)
+-        }
+-        .expect("attempted to retransmit a packet to an unknown recipient - we shouldn't have sent the original packet in the first place!");
++        };
++
++        // TODO: we currently ignore retransmissions for our custom SURBs that are created external
++        //.expect("attempted to retransmit a packet to an unknown recipient - we shouldn't have sent the original packet in the first place!");
++        let Some((maybe_reply_surb, _)) = x else {
++            return;
++        };
+ 
+         if let Some(reply_surb) = maybe_reply_surb {
+             match self
+                 .message_handler
+-                .try_prepare_single_reply_chunk_for_sending(reply_surb, ack_ref.fragment_data())
++                .try_prepare_single_reply_chunk_for_sending(
++                    reply_surb,
++                    ack_ref.fragment_data(),
++                    SurbOrigin::SourceCreated,
++                )
+                 .await
+             {
+                 Ok(prepared) => {
+diff --git a/common/crypto/Cargo.toml b/common/crypto/Cargo.toml
+index c6521d905..e4d2723c9 100644
+--- a/common/crypto/Cargo.toml
++++ b/common/crypto/Cargo.toml
+@@ -20,6 +20,8 @@ cipher = { version = "0.4.3", optional = true }
+ x25519-dalek = { version = "1.1", optional = true }
+ ed25519-dalek = { version = "1.0", optional = true }
+ rand = { version = "0.7.3", features = ["wasm-bindgen"], optional = true }
++rand_chacha = { version = "0.2.2", optional = true}
++rand_seeder = { version = "0.2.2", optional = true}
+ serde_bytes = { version = "0.11.6", optional = true }
+ serde_crate = { version = "1.0", optional = true, default_features = false, features = ["derive"], package = "serde" }
+ subtle-encoding = { version = "0.5", features =  ["bech32-preview"]}
+@@ -31,10 +33,11 @@ nym-sphinx-types = { path = "../nymsphinx/types", version = "0.2.0" }
+ nym-pemstore = { path = "../../common/pemstore", version = "0.3.0" }
+ 
+ [dev-dependencies]
+-rand_chacha = "0.2"
++rand_chacha = "0.2.2"
+ 
+ [features]
+ serde = ["serde_crate", "serde_bytes", "ed25519-dalek/serde", "x25519-dalek/serde"]
+ asymmetric = ["x25519-dalek", "ed25519-dalek", "zeroize"]
+ hashing = ["blake3", "digest", "hkdf", "hmac", "generic-array"]
+ symmetric = ["aes", "ctr", "cipher", "generic-array"]
++prng = ["rand_chacha", "rand_seeder"]
+diff --git a/common/crypto/src/asymmetric/encryption/mod.rs b/common/crypto/src/asymmetric/encryption/mod.rs
+index 5052e785a..0ec31db26 100644
+--- a/common/crypto/src/asymmetric/encryption/mod.rs
++++ b/common/crypto/src/asymmetric/encryption/mod.rs
+@@ -102,7 +102,7 @@ impl PemStorableKeyPair for KeyPair {
+ }
+ 
+ #[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
+-pub struct PublicKey(x25519_dalek::PublicKey);
++pub struct PublicKey(pub x25519_dalek::PublicKey);
+ 
+ impl Display for PublicKey {
+     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+@@ -186,7 +186,7 @@ impl PemStorableKey for PublicKey {
+ }
+ 
+ #[derive(Zeroize, ZeroizeOnDrop)]
+-pub struct PrivateKey(x25519_dalek::StaticSecret);
++pub struct PrivateKey(pub x25519_dalek::StaticSecret);
+ 
+ impl Display for PrivateKey {
+     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+diff --git a/common/crypto/src/asymmetric/identity/mod.rs b/common/crypto/src/asymmetric/identity/mod.rs
+index c552206da..e832a242d 100644
+--- a/common/crypto/src/asymmetric/identity/mod.rs
++++ b/common/crypto/src/asymmetric/identity/mod.rs
+@@ -49,11 +49,11 @@ pub enum Ed25519RecoveryError {
+ #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+ #[cfg_attr(feature = "serde", serde(crate = "serde_crate"))]
+ pub struct KeyPair {
+-    private_key: PrivateKey,
++    pub private_key: PrivateKey,
+ 
+     // nothing secret about public key
+     #[zeroize(skip)]
+-    public_key: PublicKey,
++    pub public_key: PublicKey,
+ }
+ 
+ impl KeyPair {
+@@ -104,7 +104,7 @@ impl PemStorableKeyPair for KeyPair {
+ 
+ /// ed25519 EdDSA Public Key
+ #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+-pub struct PublicKey(ed25519_dalek::PublicKey);
++pub struct PublicKey(pub ed25519_dalek::PublicKey);
+ 
+ impl Display for PublicKey {
+     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+@@ -196,7 +196,7 @@ impl PemStorableKey for PublicKey {
+ 
+ /// ed25519 EdDSA Private Key
+ #[derive(Debug, Zeroize, ZeroizeOnDrop)]
+-pub struct PrivateKey(ed25519_dalek::SecretKey);
++pub struct PrivateKey(pub ed25519_dalek::SecretKey);
+ 
+ impl Display for PrivateKey {
+     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+diff --git a/common/crypto/src/deterministic_prng.rs b/common/crypto/src/deterministic_prng.rs
+new file mode 100644
+index 000000000..8210915f1
+--- /dev/null
++++ b/common/crypto/src/deterministic_prng.rs
+@@ -0,0 +1,72 @@
++use rand::{CryptoRng, RngCore, SeedableRng};
++use rand_chacha::{rand_core, ChaCha20Rng};
++use rand_seeder::Seeder;
++
++/// A PRNG that produces deterministic output given a nonce value.
++pub struct DeterministicPRNG {
++    rng: ChaCha20Rng,
++}
++
++impl DeterministicPRNG {
++    pub fn from_nonce(nonce: Vec<u8>) -> Self {
++        let rng = ChaCha20Rng::from_seed(Seeder::from(nonce).make_seed());
++        DeterministicPRNG { rng }
++    }
++}
++
++impl CryptoRng for DeterministicPRNG {}
++
++impl RngCore for DeterministicPRNG {
++    fn next_u32(&mut self) -> u32 {
++        self.rng.next_u32()
++    }
++
++    fn next_u64(&mut self) -> u64 {
++        self.rng.next_u64()
++    }
++
++    fn fill_bytes(&mut self, dest: &mut [u8]) {
++        self.rng.fill_bytes(dest)
++    }
++
++    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
++        self.rng.try_fill_bytes(dest)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn when_same_nonce_then_same_output() {
++        let mut rng1 = DeterministicPRNG::from_nonce(b"hello".to_vec());
++        let mut rng2 = DeterministicPRNG::from_nonce(b"hello".to_vec());
++
++        assert_eq!(rng1.next_u64(), rng2.next_u64());
++        assert_eq!(rng1.next_u32(), rng2.next_u32());
++
++        let mut bytes1 = [0u8; 32];
++        let mut bytes2 = [0u8; 32];
++        rng1.fill_bytes(&mut bytes1);
++        rng2.fill_bytes(&mut bytes2);
++
++        assert_eq!(bytes1, bytes2);
++    }
++
++    #[test]
++    fn when_different_nonce_then_different_output() {
++        let mut rng1 = DeterministicPRNG::from_nonce(b"hello".to_vec());
++        let mut rng2 = DeterministicPRNG::from_nonce(b"hellob".to_vec());
++
++        assert_ne!(rng1.next_u64(), rng2.next_u64());
++        assert_ne!(rng1.next_u32(), rng2.next_u32());
++
++        let mut bytes1 = [0u8; 32];
++        let mut bytes2 = [0u8; 32];
++        rng1.fill_bytes(&mut bytes1);
++        rng2.fill_bytes(&mut bytes2);
++
++        assert_ne!(bytes1, bytes2);
++    }
++}
+diff --git a/common/crypto/src/lib.rs b/common/crypto/src/lib.rs
+index 19aab595d..31d9cac5f 100644
+--- a/common/crypto/src/lib.rs
++++ b/common/crypto/src/lib.rs
+@@ -6,6 +6,8 @@ pub mod asymmetric;
+ pub mod bech32_address_validation;
+ #[cfg(feature = "hashing")]
+ pub mod crypto_hash;
++#[cfg(feature = "prng")]
++pub mod deterministic_prng;
+ #[cfg(feature = "hashing")]
+ pub mod hkdf;
+ #[cfg(feature = "hashing")]
+diff --git a/common/nymsphinx/anonymous-replies/src/reply_surb.rs b/common/nymsphinx/anonymous-replies/src/reply_surb.rs
+index 2bf579991..3d1d95470 100644
+--- a/common/nymsphinx/anonymous-replies/src/reply_surb.rs
++++ b/common/nymsphinx/anonymous-replies/src/reply_surb.rs
+@@ -2,11 +2,13 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use crate::encryption_key::{SurbEncryptionKey, SurbEncryptionKeyError, SurbEncryptionKeySize};
+-use nym_crypto::{generic_array::typenum::Unsigned, Digest};
+-use nym_sphinx_addressing::clients::Recipient;
++use nym_crypto::generic_array::typenum::Unsigned;
++use nym_sphinx_addressing::clients::{ClientEncryptionKey, Recipient};
+ use nym_sphinx_addressing::nodes::{NymNodeRoutingAddress, MAX_NODE_ADDRESS_UNPADDED_LEN};
+ use nym_sphinx_params::packet_sizes::PacketSize;
+-use nym_sphinx_params::{PacketType, ReplySurbKeyDigestAlgorithm, DEFAULT_NUM_MIX_HOPS};
++use nym_sphinx_params::{
++    PacketType, DEFAULT_NUM_MIX_HOPS, SURB_MAX_VARIANT_OVERHEAD, SURB_PUDDING_VARIANT_OVERHEAD,
++};
+ use nym_sphinx_types::{NymPacket, SURBMaterial, SphinxError, SURB};
+ use nym_topology::{NymTopology, NymTopologyError};
+ use rand::{CryptoRng, RngCore};
+@@ -17,6 +19,13 @@ use std::fmt::{self, Formatter};
+ use std::time;
+ use thiserror::Error;
+ 
++use nym_crypto::aes;
++use nym_crypto::asymmetric::encryption::KeyPair;
++use nym_crypto::ctr;
++use nym_crypto::symmetric::stream_cipher;
++use nym_crypto::symmetric::stream_cipher::CipherKey;
++type Aes128Ctr = ctr::Ctr64LE<aes::Aes128>;
++
+ #[derive(Debug, Error)]
+ pub enum ReplySurbError {
+     #[error("tried to use reply SURB with an unpadded message")]
+@@ -36,6 +45,12 @@ pub enum ReplySurbError {
+ pub struct ReplySurb {
+     pub(crate) surb: SURB,
+     pub(crate) encryption_key: SurbEncryptionKey,
++
++    // our variant header consists of
++    // - the public part of the ephemeral key pair: 32 Bytes [^1]
++    // - the encrypted surb encryption key: 16 Bytes
++    // - the encrypted 0x00...0x00 decryption check : 8 Bytes
++    pub external_variant_data: Vec<u8>,
+ }
+ 
+ // Serialize + Deserialize is not really used anymore (it was for a CBOR experiment)
+@@ -80,11 +95,9 @@ impl ReplySurb {
+     pub fn max_msg_len(packet_size: PacketSize) -> usize {
+         // For detailed explanation (of ack overhead) refer to common\nymsphinx\src\preparer.rs::available_plaintext_per_packet()
+         let ack_overhead = MAX_NODE_ADDRESS_UNPADDED_LEN + PacketSize::AckPacket.size();
+-        packet_size.plaintext_size() - ack_overhead - ReplySurbKeyDigestAlgorithm::output_size() - 1
++        packet_size.plaintext_size() - ack_overhead - SURB_MAX_VARIANT_OVERHEAD - 1
+     }
+ 
+-    // TODO: should this return `ReplySURBError` for consistency sake
+-    // or keep `NymTopologyError` because it's the only error it can actually return?
+     pub fn construct<R>(
+         rng: &mut R,
+         recipient: &Recipient,
+@@ -96,18 +109,73 @@ impl ReplySurb {
+     {
+         let route =
+             topology.random_route_to_gateway(rng, DEFAULT_NUM_MIX_HOPS, recipient.gateway())?;
+-        let delays = nym_sphinx_routing::generate_hop_delays(average_delay, route.len());
++        let delays = nym_sphinx_routing::generate_from_average_duration_with_rng(
++            average_delay,
++            route.len(),
++            rng,
++        );
+         let destination = recipient.as_sphinx_destination();
+ 
+         let surb_material = SURBMaterial::new(route, delays, destination);
++        let surb = surb_material.construct_SURB_with_rng(rng).unwrap();
++
++        let encryption_key = SurbEncryptionKey::new(rng);
++        let external_variant_data = Self::build_external_variant_data(&recipient, &encryption_key, rng);
+ 
+         // this can't fail as we know we have a valid route to gateway and have correct number of delays
+         Ok(ReplySurb {
+-            surb: surb_material.construct_SURB().unwrap(),
+-            encryption_key: SurbEncryptionKey::new(rng),
++            surb,
++            encryption_key,
++            external_variant_data,
+         })
+     }
+ 
++    fn build_external_variant_data<R>(
++        recipient: &Recipient,
++        surb_encryption_key: &SurbEncryptionKey,
++        rng: &mut R,
++    ) -> Vec<u8>
++        where
++            R: RngCore + CryptoRng,{
++        // derive an ephemeral secret using an ephemeral key pair and the recipient public key
++        let ephemeral_key_pair = KeyPair::new(rng);
++        let recipient_public_key: &ClientEncryptionKey = recipient.encryption_key();
++        let ephemeral_secret = ephemeral_key_pair
++            .private_key()
++            .diffie_hellman(recipient_public_key);
++
++        // encrypt the surb encryption key using the ephemeral secret
++        // TODO: both `iv` and `key` should use a KDF
++        let iv = stream_cipher::iv_from_slice::<Aes128Ctr>(&ephemeral_secret[..16]);
++        let key = CipherKey::<Aes128Ctr>::from_slice(&ephemeral_secret[16..32]);
++
++        let encrypted_encryption_key =
++            stream_cipher::encrypt::<Aes128Ctr>(&key, &iv, &surb_encryption_key.to_bytes());
++
++        // we include 8 bytes of 0x00 as a convenient decryption check
++        let encrypted_zeros = stream_cipher::encrypt::<Aes128Ctr>(
++            &key,
++            &stream_cipher::zero_iv::<Aes128Ctr>(), // all zero IV is fine here; but better use KDF
++            &[0u8; 8],
++        );
++
++        // our variant header consists of
++        // - the public part of the ephemeral key pair: 32 Bytes [^1]
++        // - the encrypted surb encryption key: 16 Bytes
++        // - the encrypted 0x00...0x00 decryption check : 8 Bytes
++        //
++        // [^1] Note: for a real-world implementation we would want to blind this using Elligator
++        // or similar so that this part of the payload is also indistinguishable from a random
++        // string.
++        ephemeral_key_pair
++            .public_key()
++            .to_bytes()
++            .into_iter()
++            .chain(encrypted_zeros)
++            .chain(encrypted_encryption_key)
++            .collect::<Vec<_>>()
++    }
++
+     /// Returns the expected number of bytes the [`ReplySURB`] will take after serialization.
+     /// Useful for deserialization from a bytes stream.
+     pub fn serialized_len(mix_hops: u8) -> usize {
+@@ -116,6 +184,7 @@ impl ReplySurb {
+         // the SURB itself consists of SURB_header, first hop address and set of payload keys
+         // (note extra 1 for the gateway)
+         SurbEncryptionKeySize::USIZE
++            + SURB_PUDDING_VARIANT_OVERHEAD
+             + HEADER_SIZE
+             + NODE_ADDRESS_LENGTH
+             + (1 + mix_hops as usize) * PAYLOAD_KEY_SIZE
+@@ -126,21 +195,27 @@ impl ReplySurb {
+     }
+ 
+     pub fn to_bytes(&self) -> Vec<u8> {
+-        // KEY || SURB_BYTES
++        // KEY || EXTERNAL_VARIANT_DATA || SURB_BYTES
+         self.encryption_key
+             .to_bytes()
+             .into_iter()
++            .chain(self.external_variant_data.clone().into_iter())
+             .chain(self.surb.to_bytes().into_iter())
+             .collect()
+     }
+ 
+     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ReplySurbError> {
+         // TODO: introduce bound checks to guard us against out of bound reads
++        let offset_after_encryption_key = SurbEncryptionKeySize::USIZE;
++        let offset_after_variant_data = offset_after_encryption_key + SURB_PUDDING_VARIANT_OVERHEAD;
+ 
+         let encryption_key =
+-            SurbEncryptionKey::try_from_bytes(&bytes[..SurbEncryptionKeySize::USIZE])?;
++            SurbEncryptionKey::try_from_bytes(&bytes[..offset_after_encryption_key])?;
++
++        let external_variant_data =
++            Vec::from(&bytes[offset_after_encryption_key..offset_after_variant_data]);
+ 
+-        let surb = match SURB::from_bytes(&bytes[SurbEncryptionKeySize::USIZE..]) {
++        let surb = match SURB::from_bytes(&bytes[offset_after_variant_data..]) {
+             Err(err) => return Err(ReplySurbError::RecoveryError(err)),
+             Ok(surb) => surb,
+         };
+@@ -148,6 +223,7 @@ impl ReplySurb {
+         Ok(ReplySurb {
+             surb,
+             encryption_key,
++            external_variant_data,
+         })
+     }
+ 
+@@ -177,6 +253,11 @@ impl ReplySurb {
+     ) -> Result<(NymPacket, NymNodeRoutingAddress), ReplySurbError> {
+         let message_bytes = message.as_ref();
+         if message_bytes.len() != packet_size.plaintext_size() {
++            eprintln!(
++                "{} != {}",
++                message_bytes.len(),
++                packet_size.plaintext_size()
++            );
+             return Err(ReplySurbError::UnpaddedMessageError);
+         }
+ 
+diff --git a/common/nymsphinx/chunking/src/set.rs b/common/nymsphinx/chunking/src/set.rs
+index be5ae739d..977f1d9ad 100644
+--- a/common/nymsphinx/chunking/src/set.rs
++++ b/common/nymsphinx/chunking/src/set.rs
+@@ -5,6 +5,7 @@ use crate::fragment::{
+     linked_fragment_payload_max_len, unlinked_fragment_payload_max_len, Fragment,
+     LINKED_FRAGMENTED_HEADER_LEN, UNLINKED_FRAGMENTED_HEADER_LEN,
+ };
++use log::info;
+ use rand::Rng;
+ 
+ /// In the simplest case of message being divided into a single set, the set has the upper bound
+@@ -80,7 +81,7 @@ pub(crate) fn generate_set_id<R: Rng>(rng: &mut R) -> i32 {
+ 
+ /// Splits underlying message into multiple `Fragment`s while all of them fit in a single
+ /// `Set` (number of `Fragment`s <= 255)
+-fn prepare_unlinked_fragmented_set(
++pub fn prepare_unlinked_fragmented_set(
+     message: &[u8],
+     id: i32,
+     max_plaintext_size: usize,
+@@ -241,6 +242,7 @@ pub fn split_into_sets<R: Rng>(
+ ) -> Vec<FragmentSet> {
+     let num_of_sets = total_number_of_sets(message.len(), max_plaintext_size);
+     if num_of_sets == 1 {
++        info!("single set split");
+         let set_id = generate_set_id(rng);
+         vec![prepare_fragment_set(
+             message,
+diff --git a/common/nymsphinx/params/src/lib.rs b/common/nymsphinx/params/src/lib.rs
+index 7ad247dfa..8c9fa684d 100644
+--- a/common/nymsphinx/params/src/lib.rs
++++ b/common/nymsphinx/params/src/lib.rs
+@@ -47,6 +47,10 @@ pub type GatewaySharedKeyHkdfAlgorithm = blake3::Hasher;
+ /// Hashing algorithm used when computing digest of a reply SURB encryption key.
+ pub type ReplySurbKeyDigestAlgorithm = blake3::Hasher;
+ 
++pub const SURB_NORMAL_VARIANT_OVERHEAD: usize = 32;
++pub const SURB_PUDDING_VARIANT_OVERHEAD: usize = 32 + 8 + 16;
++pub const SURB_MAX_VARIANT_OVERHEAD: usize = SURB_PUDDING_VARIANT_OVERHEAD;
++
+ /// Hashing algorithm used when computing integrity (H)Mac for message exchanged between client and gateway.
+ // TODO: if updated, the pem type defined in gateway\gateway-requests\src\registration\handshake\shared_key
+ // needs updating!
+diff --git a/common/nymsphinx/routing/Cargo.toml b/common/nymsphinx/routing/Cargo.toml
+index c0f7cf762..5bac23b7c 100644
+--- a/common/nymsphinx/routing/Cargo.toml
++++ b/common/nymsphinx/routing/Cargo.toml
+@@ -8,7 +8,8 @@ license = { workspace = true }
+ repository = { workspace = true }
+ 
+ [dependencies]
++rand = { version = "0.7.3", features = ["wasm-bindgen"] }
+ thiserror = { workspace = true }
+ 
+ nym-sphinx-addressing = { path = "../addressing" }
+-nym-sphinx-types = { path = "../types" }
+\ No newline at end of file
++nym-sphinx-types = { path = "../types" }
+diff --git a/common/nymsphinx/routing/src/lib.rs b/common/nymsphinx/routing/src/lib.rs
+index e8881b409..db6e39a67 100644
+--- a/common/nymsphinx/routing/src/lib.rs
++++ b/common/nymsphinx/routing/src/lib.rs
+@@ -5,6 +5,7 @@ use std::time::Duration;
+ 
+ use nym_sphinx_addressing::clients::Recipient;
+ use nym_sphinx_types::{delays, Delay, Node};
++use rand::{CryptoRng, RngCore};
+ use thiserror::Error;
+ 
+ pub trait SphinxRouteMaker {
+@@ -51,3 +52,18 @@ pub fn generate_hop_delays(average_packet_delay: Duration, num_hops: usize) -> V
+         delays::generate_from_average_duration(num_hops, average_packet_delay)
+     }
+ }
++
++pub fn generate_from_average_duration_with_rng<R>(
++    average_packet_delay: Duration,
++    num_hops: usize,
++    rng: &mut R,
++) -> Vec<Delay>
++where
++    R: CryptoRng + RngCore,
++{
++    if average_packet_delay.is_zero() {
++        vec![nym_sphinx_types::Delay::new_from_millis(0); num_hops]
++    } else {
++        delays::generate_from_average_duration_with_rng(num_hops, average_packet_delay, rng)
++    }
++}
+diff --git a/common/nymsphinx/src/message.rs b/common/nymsphinx/src/message.rs
+index 7a8f3b653..345ff862d 100644
+--- a/common/nymsphinx/src/message.rs
++++ b/common/nymsphinx/src/message.rs
+@@ -3,7 +3,6 @@
+ 
+ use crate::chunking;
+ use nym_crypto::asymmetric::encryption;
+-use nym_crypto::Digest;
+ use nym_sphinx_addressing::clients::Recipient;
+ use nym_sphinx_addressing::nodes::MAX_NODE_ADDRESS_UNPADDED_LEN;
+ use nym_sphinx_anonymous_replies::requests::{
+@@ -11,7 +10,7 @@ use nym_sphinx_anonymous_replies::requests::{
+     ReplyMessageContent,
+ };
+ use nym_sphinx_chunking::fragment::Fragment;
+-use nym_sphinx_params::{PacketSize, PacketType, ReplySurbKeyDigestAlgorithm};
++use nym_sphinx_params::{PacketSize, PacketType, SURB_MAX_VARIANT_OVERHEAD};
+ use rand::Rng;
+ use std::fmt::{Display, Formatter};
+ use thiserror::Error;
+@@ -186,7 +185,9 @@ impl NymMessage {
+             NymMessage::Plain(_) | NymMessage::Repliable(_) => encryption::PUBLIC_KEY_SIZE,
+             // each reply attaches the digest of the encryption key so that the recipient could
+             // lookup correct key for decryption,
+-            NymMessage::Reply(_) => ReplySurbKeyDigestAlgorithm::output_size(),
++
++            // TODO FIXME PUDDING: add additional 16 Bytes here!
++            NymMessage::Reply(_) => SURB_MAX_VARIANT_OVERHEAD,
+         };
+ 
+         let packet_type = PacketType::from(packet_size);
+diff --git a/common/nymsphinx/src/preparer/mod.rs b/common/nymsphinx/src/preparer/mod.rs
+index e6892f773..9dc27ddf9 100644
+--- a/common/nymsphinx/src/preparer/mod.rs
++++ b/common/nymsphinx/src/preparer/mod.rs
+@@ -1,10 +1,12 @@
+ // Copyright 2021-2023 - Nym Technologies SA <contact@nymtech.net>
+ // SPDX-License-Identifier: Apache-2.0
+ 
+-use crate::message::{NymMessage, ACK_OVERHEAD, OUTFOX_ACK_OVERHEAD};
+-use crate::NymPayloadBuilder;
++use std::convert::TryFrom;
++use std::time::Duration;
++
++use rand::{CryptoRng, Rng};
++
+ use nym_crypto::asymmetric::encryption;
+-use nym_crypto::Digest;
+ use nym_sphinx_acknowledgements::surb_ack::SurbAck;
+ use nym_sphinx_acknowledgements::AckKey;
+ use nym_sphinx_addressing::clients::Recipient;
+@@ -13,12 +15,12 @@ use nym_sphinx_anonymous_replies::reply_surb::ReplySurb;
+ use nym_sphinx_chunking::fragment::{Fragment, FragmentIdentifier};
+ use nym_sphinx_forwarding::packet::MixPacket;
+ use nym_sphinx_params::packet_sizes::PacketSize;
+-use nym_sphinx_params::{PacketType, ReplySurbKeyDigestAlgorithm, DEFAULT_NUM_MIX_HOPS};
++use nym_sphinx_params::{PacketType, DEFAULT_NUM_MIX_HOPS, SURB_MAX_VARIANT_OVERHEAD};
+ use nym_sphinx_types::{Delay, NymPacket};
+ use nym_topology::{NymTopology, NymTopologyError};
+-use rand::{CryptoRng, Rng};
+-use std::convert::TryFrom;
+-use std::time::Duration;
++
++use crate::message::{NymMessage, ACK_OVERHEAD, OUTFOX_ACK_OVERHEAD};
++use crate::NymPayloadBuilder;
+ 
+ pub(crate) mod payload;
+ 
+@@ -37,6 +39,18 @@ pub struct PreparedFragment {
+     pub fragment_identifier: FragmentIdentifier,
+ }
+ 
++#[derive(Clone, Copy)]
++pub enum SurbOrigin {
++    /// A regular SURB using the normal Nym procedure: it is created by the eventual destination
++    /// and encrypted under a key that the destination has in their database; key selection happens
++    /// via a digest at the beginning of the message
++    SourceCreated,
++
++    /// A SURB that has been created by a third-party. Hence the destination cannot know its
++    /// encryption key. Instead, an ephemeral X25519 is included to derive a shared secret.
++    External,
++}
++
+ impl From<PreparedFragment> for MixPacket {
+     fn from(value: PreparedFragment) -> Self {
+         value.mix_packet
+@@ -109,10 +123,11 @@ pub trait FragmentPreparer {
+         reply_surb: ReplySurb,
+         packet_sender: &Recipient,
+         packet_type: PacketType,
++        surb_origin: SurbOrigin,
+     ) -> Result<PreparedFragment, NymTopologyError> {
+         // each reply attaches the digest of the encryption key so that the recipient could
+         // lookup correct key for decryption,
+-        let reply_overhead = ReplySurbKeyDigestAlgorithm::output_size();
++        let reply_overhead = SURB_MAX_VARIANT_OVERHEAD;
+         let expected_plaintext = match packet_type {
+             PacketType::Outfox => fragment.serialized_size() + OUTFOX_ACK_OVERHEAD + reply_overhead,
+             _ => fragment.serialized_size() + ACK_OVERHEAD + reply_overhead,
+@@ -141,9 +156,18 @@ pub trait FragmentPreparer {
+         )?;
+         let ack_delay = surb_ack.expected_total_delay();
+ 
+-        let packet_payload = match NymPayloadBuilder::new(fragment, surb_ack)
+-            .build_reply(reply_surb.encryption_key())
+-        {
++        let maybe_packet_payload = match surb_origin {
++            SurbOrigin::SourceCreated => {
++                NymPayloadBuilder::new(fragment, surb_ack).build_reply(reply_surb.encryption_key())
++            }
++            SurbOrigin::External => NymPayloadBuilder::new(fragment, surb_ack)
++                .build_external_reply(
++                    reply_surb.encryption_key(),
++                    &reply_surb.external_variant_data,
++                ),
++        };
++
++        let packet_payload = match maybe_packet_payload {
+             Ok(payload) => payload,
+             Err(_e) => return Err(NymTopologyError::PayloadBuilder),
+         };
+@@ -368,6 +392,7 @@ where
+         ack_key: &AckKey,
+         reply_surb: ReplySurb,
+         packet_type: PacketType,
++        surb_origin: SurbOrigin,
+     ) -> Result<PreparedFragment, NymTopologyError> {
+         let sender = self.sender_address;
+ 
+@@ -379,6 +404,7 @@ where
+             reply_surb,
+             &sender,
+             packet_type,
++            surb_origin,
+         )
+     }
+ 
+diff --git a/common/nymsphinx/src/preparer/payload.rs b/common/nymsphinx/src/preparer/payload.rs
+index 599902625..07f4f2c81 100644
+--- a/common/nymsphinx/src/preparer/payload.rs
++++ b/common/nymsphinx/src/preparer/payload.rs
+@@ -11,6 +11,7 @@ use nym_sphinx_anonymous_replies::SurbEncryptionKey;
+ use nym_sphinx_chunking::fragment::Fragment;
+ use nym_sphinx_params::{
+     PacketEncryptionAlgorithm, PacketHkdfAlgorithm, ReplySurbEncryptionAlgorithm,
++    SURB_MAX_VARIANT_OVERHEAD, SURB_NORMAL_VARIANT_OVERHEAD,
+ };
+ use rand::{CryptoRng, RngCore};
+ 
+@@ -61,9 +62,22 @@ impl NymPayloadBuilder {
+         packet_encryption_key: &SurbEncryptionKey,
+     ) -> Result<NymPayload, SurbAckRecoveryError> {
+         let key_digest = packet_encryption_key.compute_digest();
++        let padding = vec![0u8; SURB_MAX_VARIANT_OVERHEAD - SURB_NORMAL_VARIANT_OVERHEAD];
+         self.build::<ReplySurbEncryptionAlgorithm>(
+             packet_encryption_key.inner(),
+-            key_digest.into_iter(),
++            key_digest.into_iter().chain(padding).collect::<Vec<_>>(),
++        )
++    }
++
++    pub fn build_external_reply(
++        self,
++        packet_encryption_key: &SurbEncryptionKey,
++        variant_data: &Vec<u8>,
++    ) -> Result<NymPayload, SurbAckRecoveryError> {
++        // no padding needed here as we are already the longest variant
++        self.build::<ReplySurbEncryptionAlgorithm>(
++            packet_encryption_key.inner(),
++            variant_data.clone(),
+         )
+     }
+ 
+diff --git a/common/nymsphinx/types/Cargo.toml b/common/nymsphinx/types/Cargo.toml
+index 2c52ef03d..b1572c36f 100644
+--- a/common/nymsphinx/types/Cargo.toml
++++ b/common/nymsphinx/types/Cargo.toml
+@@ -8,6 +8,6 @@ license = { workspace = true }
+ repository = { workspace = true }
+ 
+ [dependencies]
+-sphinx-packet = { version = "0.1.0" }
++sphinx-packet = { workspace = true }
+ nym-outfox = { path = "../../../nym-outfox" }
+ thiserror = "1"
+diff --git a/nym-outfox/Cargo.toml b/nym-outfox/Cargo.toml
+index abf7104fc..565545ee2 100644
+--- a/nym-outfox/Cargo.toml
++++ b/nym-outfox/Cargo.toml
+@@ -18,7 +18,7 @@ curve25519-dalek = "3.2"
+ chacha20poly1305 = "0.10.1"
+ getrandom = { workspace = true, features = ["js"] }
+ thiserror = "1"
+-sphinx-packet = "0.1.0"
++sphinx-packet = { workspace = true }
+ rand = "0.7.3"
+ log = "0.4"
+ 
+diff --git a/sdk/rust/nym-sdk/Cargo.toml b/sdk/rust/nym-sdk/Cargo.toml
+index 94f6656df..f43282805 100644
+--- a/sdk/rust/nym-sdk/Cargo.toml
++++ b/sdk/rust/nym-sdk/Cargo.toml
+@@ -7,8 +7,10 @@ edition = "2021"
+ 
+ [dependencies]
+ bip39 = { workspace = true }
++bs58 = "0.5.0"
++
+ nym-client-core = { path = "../../../common/client-core", features = ["fs-surb-storage"]}
+-nym-crypto = { path = "../../../common/crypto" }
++nym-crypto = { path = "../../../common/crypto", features = ["prng"] }
+ nym-gateway-requests = { path = "../../../gateway/gateway-requests" }
+ nym-bandwidth-controller = { path = "../../../common/bandwidth-controller" }
+ nym-credentials = { path = "../../../common/credentials" }
+diff --git a/sdk/rust/nym-sdk/examples/pudding_deterministic_external_surb_with_fragmentation.rs b/sdk/rust/nym-sdk/examples/pudding_deterministic_external_surb_with_fragmentation.rs
+new file mode 100644
+index 000000000..2b9d90c1f
+--- /dev/null
++++ b/sdk/rust/nym-sdk/examples/pudding_deterministic_external_surb_with_fragmentation.rs
+@@ -0,0 +1,74 @@
++use nym_sdk::mixnet;
++use nym_sdk::mixnet::ReplySurb;
++use nym_sphinx::forwarding::packet::MixPacket;
++
++#[tokio::main]
++async fn main() {
++    nym_bin_common::logging::setup_logging();
++
++    // that's Alice: creating the packets
++    let mut alice = mixnet::MixnetClient::connect_new().await.unwrap();
++    let alice_address = alice.nym_address().clone();
++    println!("alice_address={alice_address}");
++
++    // that's Bob: the eventual recipient of the message
++    let mut bob = mixnet::MixnetClient::connect_new().await.unwrap();
++    let bob_address = bob.nym_address();
++    println!("bob_address={bob_address}");
++
++    // that's Charlie: they create the SURBS and later the packets
++    let charlie = mixnet::MixnetClient::connect_new().await.unwrap();
++    let charlie_address = charlie.nym_address();
++    println!("charlie_address={charlie_address}");
++
++    // Charlie (e.g. the discover node) creates some SURBs
++    let surbs = charlie
++        .create_surbs(&bob_address, b"nonce".to_vec(), 5)
++        .await
++        .unwrap();
++
++    // check that process is indeed deterministic
++    let surbs2 = charlie
++        .create_surbs(&bob_address, b"nonce".to_vec(), 5)
++        .await
++        .unwrap();
++    assert_eq!(surbs[0].to_base58_string(), surbs2[0].to_base58_string());
++
++    // serialize and deserialize surbs
++    let many_serialized_surbs: Vec<String> = surbs
++        .into_iter()
++        .map(|x| x.to_base58_string())
++        .collect();
++    assert_eq!(many_serialized_surbs.len(), 5);
++    let surbs_restored: Vec<ReplySurb> = many_serialized_surbs
++        .into_iter()
++        .map(|x| ReplySurb::from_base58_string(x).unwrap())
++        .collect();
++
++    // Alice then takes those SURBs and creates packets for Bob
++    // (using a long message that requires fragmentation)
++    let packets = alice
++        .create_mix_packet_with_surbs([42u8; 4000], surbs_restored)
++        .await
++        .unwrap();
++    println!("packets={:?}", packets);
++
++    // Charlie then sends those packets to Bob (i.e. being a reflecting node)
++
++    // serialize and deserialize prepared packets
++    let serialized_packets: Vec<Vec<u8>> = packets
++        .into_iter()
++        .map(|x| x.into_bytes().unwrap())
++        .collect();
++    let packets = serialized_packets
++        .into_iter()
++        .map(|x| MixPacket::try_from_bytes(x.as_slice()).unwrap())
++        .collect();
++
++    // let's do the actual sending
++    charlie.send_packets(packets).await;
++
++    // let's see that they receive our message
++    bob.on_messages(|msg| println!("Received: {}", String::from_utf8_lossy(&msg.message)))
++        .await;
++}
+diff --git a/sdk/rust/nym-sdk/examples/pudding_deterministic_surb_with_fragmentation.rs b/sdk/rust/nym-sdk/examples/pudding_deterministic_surb_with_fragmentation.rs
+new file mode 100644
+index 000000000..2725f88fe
+--- /dev/null
++++ b/sdk/rust/nym-sdk/examples/pudding_deterministic_surb_with_fragmentation.rs
+@@ -0,0 +1,46 @@
++use nym_sdk::mixnet;
++use nym_sphinx::anonymous_replies::ReplySurb;
++
++#[tokio::main]
++async fn main() {
++    nym_bin_common::logging::setup_logging();
++
++    // that's Alice: creating the SURBs
++    let alice = mixnet::MixnetClient::connect_new().await.unwrap();
++    let alice_address = alice.nym_address();
++    println!("alice_address={alice_address}");
++
++    // that's Bob: the eventual recipient of the message
++    let mut bob = mixnet::MixnetClient::connect_new().await.unwrap();
++    let bob_address = bob.nym_address();
++    println!("bob_address={bob_address}");
++
++    let many_surbs = alice
++        .create_surbs(bob_address, b"nonce".to_vec(), 10)
++        .await
++        .unwrap();
++    let many_serialized_surbs: Vec<String> = many_surbs
++        .into_iter()
++        .map(|x| x.to_base58_string())
++        .collect();
++    assert_eq!(many_serialized_surbs.len(), 10);
++
++    // that's Charlie: they use our SURBs to send a message
++    let charlie = mixnet::MixnetClient::connect_new().await.unwrap();
++    let charlie_address = charlie.nym_address();
++    println!("charlie_address={charlie_address}");
++
++    // the message is much larger than what would fit in the payload of a single message
++    let many_surbs: Vec<ReplySurb> = many_serialized_surbs
++        .into_iter()
++        .map(|x| ReplySurb::from_base58_string(x).unwrap())
++        .collect();
++    let very_long_message = [42u8; 4000];
++    charlie
++        .send_bytes_with_surbs(many_surbs, very_long_message)
++        .await;
++
++    // and back to Bob: let's see that they receive our message
++    bob.on_messages(|msg| println!("Received a message with {} bytes", &msg.message.len()))
++        .await;
++}
+diff --git a/sdk/rust/nym-sdk/examples/secrets.rs b/sdk/rust/nym-sdk/examples/secrets.rs
+new file mode 100644
+index 000000000..984b39f3e
+--- /dev/null
++++ b/sdk/rust/nym-sdk/examples/secrets.rs
+@@ -0,0 +1,28 @@
++use nym_sdk::mixnet;
++use std::ops::Deref;
++
++#[tokio::main]
++async fn main() {
++    nym_bin_common::logging::setup_logging();
++
++    let client = mixnet::MixnetClient::connect_new().await.unwrap();
++
++    let our_address = client.nym_address();
++    println!("Our client nym address is: {our_address}");
++
++    let secrets = client.get_secrets();
++    println!(
++        "Our identity keypair: {:?}",
++        secrets.identity_keypair.deref()
++    );
++
++    // The encryption keypair uses the `x25519_dalek` crate which does not like `Debug`
++    println!(
++        "Our encryption public key: {:?}",
++        secrets.encryption_keypair.public_key().to_base58_string()
++    );
++    println!(
++        "Our encryption secret key: {:?}",
++        secrets.encryption_keypair.private_key().to_base58_string()
++    );
++}
+diff --git a/sdk/rust/nym-sdk/src/mixnet.rs b/sdk/rust/nym-sdk/src/mixnet.rs
+index c1b85aaff..80075d8dc 100644
+--- a/sdk/rust/nym-sdk/src/mixnet.rs
++++ b/sdk/rust/nym-sdk/src/mixnet.rs
+@@ -60,6 +60,9 @@ pub use nym_credential_storage::{
+     ephemeral_storage::EphemeralStorage as EphemeralCredentialStorage, models::CoconutCredential,
+     storage::Storage as CredentialStorage,
+ };
++pub use nym_crypto::asymmetric::{
++    encryption::KeyPair as EncryptionKeyPair, identity::KeyPair as IdentityKeyPair,
++};
+ pub use nym_network_defaults::NymNetworkDetails;
+ pub use nym_socks5_client_core::config::Socks5;
+ pub use nym_sphinx::{
+@@ -68,6 +71,8 @@ pub use nym_sphinx::{
+         nodes::NodeIdentity,
+     },
+     anonymous_replies::requests::AnonymousSenderTag,
++    anonymous_replies::ReplySurb,
++    forwarding::packet::MixPacket,
+     receiver::ReconstructedMessage,
+ };
+ pub use nym_topology::{provider_trait::TopologyProvider, NymTopology};
+diff --git a/sdk/rust/nym-sdk/src/mixnet/client.rs b/sdk/rust/nym-sdk/src/mixnet/client.rs
+index 33185ccd8..e9dc16c70 100644
+--- a/sdk/rust/nym-sdk/src/mixnet/client.rs
++++ b/sdk/rust/nym-sdk/src/mixnet/client.rs
+@@ -489,13 +489,16 @@ where
+         if self.socks5_config.is_some() {
+             return Err(Error::Socks5Config { set: true });
+         }
++        let config = self.config.debug_config.clone();
++
+         let (mut started_client, nym_address) = self.connect_to_mixnet_common().await?;
+         let client_input = started_client.client_input.register_producer();
+         let mut client_output = started_client.client_output.register_consumer();
+         let client_state = started_client.client_state;
+ 
+-        let reconstructed_receiver = client_output.register_receiver()?;
++        let client_secrets = started_client.client_secrets.clone();
+ 
++        let reconstructed_receiver = client_output.register_receiver()?;
+         Ok(MixnetClient {
+             nym_address,
+             client_input,
+@@ -504,6 +507,8 @@ where
+             reconstructed_receiver,
+             task_manager: started_client.task_manager,
+             packet_type: None,
++            config,
++            client_secrets,
+         })
+     }
+ }
+diff --git a/sdk/rust/nym-sdk/src/mixnet/native_client.rs b/sdk/rust/nym-sdk/src/mixnet/native_client.rs
+index 569997dcc..d7ed6ad0b 100644
+--- a/sdk/rust/nym-sdk/src/mixnet/native_client.rs
++++ b/sdk/rust/nym-sdk/src/mixnet/native_client.rs
+@@ -1,17 +1,29 @@
++use std::iter::zip;
++
++use futures::StreamExt;
++use rand::rngs::OsRng;
++
++use nym_client_core::client::base_client::ClientSecrets;
+ use nym_client_core::client::{
+     base_client::{ClientInput, ClientOutput, ClientState},
+     inbound_messages::InputMessage,
+     received_buffer::ReconstructedMessagesReceiver,
+ };
++use nym_client_core::config::DebugConfig;
++use nym_crypto::deterministic_prng::DeterministicPRNG;
++use nym_sphinx::acknowledgements::AckKey;
+ use nym_sphinx::addressing::clients::Recipient;
++use nym_sphinx::anonymous_replies::requests::{AnonymousSenderTag, ReplyMessage};
++use nym_sphinx::anonymous_replies::ReplySurb;
++use nym_sphinx::forwarding::packet::MixPacket;
++use nym_sphinx::message::NymMessage;
++use nym_sphinx::params::PacketSize;
++use nym_sphinx::preparer::{MessagePreparer, SurbOrigin};
+ use nym_sphinx::{params::PacketType, receiver::ReconstructedMessage};
+ use nym_task::{
+     connections::{ConnectionCommandSender, LaneQueueLengths, TransmissionLane},
+     TaskManager,
+ };
+-
+-use futures::StreamExt;
+-use nym_sphinx::anonymous_replies::requests::AnonymousSenderTag;
+ use nym_topology::NymTopology;
+ 
+ use crate::mixnet::client::{IncludedSurbs, MixnetClientBuilder};
+@@ -41,6 +53,9 @@ pub struct MixnetClient {
+     /// The task manager that controlls all the spawned tasks that the clients uses to do it's job.
+     pub(crate) task_manager: TaskManager,
+     pub(crate) packet_type: Option<PacketType>,
++    pub(crate) config: DebugConfig,
++
++    pub(crate) client_secrets: ClientSecrets,
+ }
+ 
+ impl MixnetClient {
+@@ -72,6 +87,11 @@ impl MixnetClient {
+         &self.nym_address
+     }
+ 
++    /// With great power comes great responsibility 👀
++    pub fn get_secrets(&self) -> &ClientSecrets {
++        return &self.client_secrets;
++    }
++
+     /// Get a shallow clone of [`MixnetClientSender`]. Useful if you want split the send and
+     /// receive logic in different locations.
+     pub fn sender(&self) -> MixnetClientSender {
+@@ -80,6 +100,152 @@ impl MixnetClient {
+         }
+     }
+ 
++    pub async fn create_surb(&self, destination: &Recipient, nonce: Vec<u8>) -> Option<ReplySurb> {
++        return match self.create_surbs(destination, nonce, 1).await {
++            None => None,
++            Some(mut surbs) => Some(surbs.remove(0)),
++        };
++    }
++
++    pub async fn create_surbs(
++        &self,
++        destination: &Recipient,
++        nonce: Vec<u8>,
++        num: u32,
++    ) -> Option<Vec<ReplySurb>> {
++        let topology_permit = self.client_state.topology_accessor.get_read_permit().await;
++        let topology_ref_option = topology_permit.as_ref();
++        if topology_ref_option.is_none() {
++            log::warn!("No valid topology available");
++            return None;
++        }
++
++        let rng = &mut DeterministicPRNG::from_nonce(nonce.to_owned());
++
++        let mut result = vec![];
++
++        for _ in 0..num {
++            let surb = ReplySurb::construct(
++                rng,
++                &destination,
++                self.config.traffic.average_packet_delay,
++                topology_ref_option.as_ref().unwrap(),
++            )
++            .unwrap();
++            result.push(surb);
++        }
++
++        return Some(result);
++    }
++
++    pub async fn create_mix_packet<M: AsRef<[u8]>>(
++        &mut self,
++        message: M,
++        recipient: &Recipient,
++    ) -> Option<Vec<MixPacket>> {
++        let topology_permit = self.client_state.topology_accessor.get_read_permit().await;
++        let topology_ref_option = topology_permit.as_ref();
++        if topology_ref_option.is_none() {
++            log::warn!("No valid topology available");
++            return None;
++        }
++        let topology = topology_ref_option.as_ref().unwrap();
++
++        let rng = &mut OsRng;
++        let mut message_preparer = MessagePreparer::new(
++            rng,
++            self.nym_address,
++            self.config.traffic.average_packet_delay,
++            self.config.acknowledgements.average_ack_delay,
++        )
++        .with_mix_hops(3);
++
++        let packet_size = PacketSize::RegularPacket;
++        let message = NymMessage::new_plain(message.as_ref().to_vec());
++        let fragments = message_preparer.pad_and_split_message(message, packet_size);
++
++        let mut mix_packets = Vec::with_capacity(fragments.len());
++
++        for fragment in fragments {
++            let chunk_clone = fragment.clone();
++
++            // Since we have no way to handle the acks anyway, we choose a random key
++            let ack_key = AckKey::new(&mut OsRng);
++
++            let prepared_fragment = message_preparer
++                .prepare_chunk_for_sending(
++                    chunk_clone,
++                    topology,
++                    &ack_key,
++                    &recipient,
++                    PacketType::Mix,
++                )
++                .unwrap();
++
++            mix_packets.push(prepared_fragment.mix_packet);
++        }
++
++        return Some(mix_packets);
++    }
++
++    pub async fn create_mix_packet_with_surbs<M: AsRef<[u8]>>(
++        &mut self,
++        message: M,
++        reply_surbs: Vec<ReplySurb>,
++    ) -> Option<Vec<MixPacket>> {
++        let topology_permit = self.client_state.topology_accessor.get_read_permit().await;
++        let topology_ref_option = topology_permit.as_ref();
++        if topology_ref_option.is_none() {
++            log::warn!("No valid topology available");
++            return None;
++        }
++        let topology = topology_ref_option.as_ref().unwrap();
++
++        let rng = &mut OsRng;
++        let mut message_preparer = MessagePreparer::new(
++            rng,
++            self.nym_address,
++            self.config.traffic.average_packet_delay,
++            self.config.acknowledgements.average_ack_delay,
++        )
++        .with_mix_hops(3);
++
++        let packet_size = PacketSize::RegularPacket;
++
++        let reply_message = ReplyMessage::new_data_message(message.as_ref().to_vec());
++        let message = NymMessage::new_reply(reply_message);
++
++        let fragments = message_preparer.pad_and_split_message(message, packet_size);
++
++        if fragments.len() > reply_surbs.len() {
++            panic! {"message ({} fragments) too long for reply surbs (amount {})!", fragments.len(), reply_surbs.len()}
++        }
++
++        let mut mix_packets = Vec::with_capacity(fragments.len());
++
++        for (reply_surb, fragment) in zip(reply_surbs.into_iter(), fragments.into_iter()) {
++            let chunk_clone = fragment.clone();
++
++            // Since we have no way to handle the acks anyway, we choose a random key
++            let ack_key = AckKey::new(&mut OsRng);
++
++            let prepared_fragment = message_preparer
++                .prepare_reply_chunk_for_sending(
++                    chunk_clone,
++                    topology,
++                    &ack_key,
++                    reply_surb,
++                    PacketType::Mix,
++                    SurbOrigin::External,
++                )
++                .unwrap();
++
++            mix_packets.push(prepared_fragment.mix_packet);
++        }
++
++        return Some(mix_packets);
++    }
++
+     /// Get a shallow clone of [`ConnectionCommandSender`]. This is useful if you want to e.g
+     /// explicitly close a transmission lane that is still sending data even though it should
+     /// cancel.
+@@ -174,6 +340,19 @@ impl MixnetClient {
+         self.send(input_msg).await
+     }
+ 
++    pub async fn send_str_with_surb(&self, surbs: Vec<ReplySurb>, message: &str) {
++        self.send_bytes_with_surbs(surbs, message).await;
++    }
++
++    pub async fn send_bytes_with_surbs<M: AsRef<[u8]>>(&self, surbs: Vec<ReplySurb>, message: M) {
++        self.send(InputMessage::WithSuppliedSurbs {
++            surbs,
++            data: Vec::from(message.as_ref()),
++            lane: TransmissionLane::General,
++        })
++        .await;
++    }
++
+     /// Sends stringy reply data to the supplied anonymous recipient.
+     ///
+     /// # Example
+@@ -227,6 +406,14 @@ impl MixnetClient {
+         }
+     }
+ 
++    pub async fn send_packets(&self, packets: Vec<MixPacket>) {
++        self.send(InputMessage::Premade {
++            msgs: packets,
++            lane: TransmissionLane::General,
++        })
++        .await
++    }
++
+     /// Sends a [`InputMessage`] to the mixnet. This is the most low-level sending function, for
+     /// full customization.
+     ///
