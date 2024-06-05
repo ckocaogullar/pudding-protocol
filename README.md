@@ -7,9 +7,6 @@ In particular, it contains the following components:
 - A Python notebook for analysis
 
 > [!NOTE]  
-> This repository is work-in-progress and will be updated for the artifact evaluation.
-
-> [!NOTE]  
 > This is an academic prototype and not fit for production use.
 
 
