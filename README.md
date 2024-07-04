@@ -140,6 +140,15 @@ It will generate all the plots and tables from the paper.
 You can find the generated figure files in the `analysis/figures` folder.
 
 
-## Bibtex 📚
+## BibTeX 📚
+The paper is available at the [IEEE Computer Society Digital Library](https://www.computer.org/csdl/proceedings-article/sp/2024/313000a167/1Ub24I5jc6A) and [arXiv](https://arxiv.org/abs/2311.10825). To cite our work, please use the following BibTeX entry:
 
-TBD once published.
+```
+@inproceedings{kocaogullar2024pudding,
+author = {Kocaoğullar, Ceren and Hugenroth, Daniel and Kleppmann, Martin and Beresford, Alastair R.},
+booktitle = {IEEE Symposium on Security and Privacy (SP)},
+title = {Pudding: Private User Discovery in Anonymity Networks},
+year = {2024},
+doi = {10.1109/SP54263.2024.00167}
+}
+```
